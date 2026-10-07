@@ -9,7 +9,7 @@
 ![Analyses](https://img.shields.io/badge/Analyses-events_%7C_Granger_%7C_forecasts-1F3864?style=for-the-badge)
 ![Assets](https://img.shields.io/badge/Assets-5-2E5FD9?style=for-the-badge)
 ![CLI commands](https://img.shields.io/badge/CLI_commands-8-6E86E8?style=for-the-badge)
-![Tests](https://img.shields.io/badge/Tests-27_passing-3DA35B?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-26_passing-3DA35B?style=for-the-badge)
 ![Offline demo](https://img.shields.io/badge/Offline_demo-Yes-F5C542?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-A0399B?style=for-the-badge)
 
@@ -113,7 +113,7 @@ ballots-to-markets gives each of these questions its own component. Each compone
 | Providers | Yahoo Finance (extra `fetch`), FRED API (`FRED_API_KEY`), a Hugging Face 3-class model (extra `nlp`), all optional |
 | Offline mode | Synthetic prices, rate and texts with planted effects, and the lexicon sentiment model |
 | Safety | No interpolation of prices or text, train-only fits, q-values, a coverage limit for text tests |
-| Tests | **27** unit tests pass (`pytest`). 1 test needs statsmodels. CI also skips the LSTM test |
+| Tests | **26** unit tests pass and **2** skip in CI (`pytest`). The 2 tests need the `stats` and `deep` extras |
 
 ```mermaid
 flowchart LR
@@ -172,7 +172,7 @@ ballots-to-markets/
 │   ├── forecast.py  lstm.py                   # walk-forward forecasts
 │   ├── pipeline.py  report.py  synthetic.py  cli.py
 │   └── data/events_2024.csv                   # built-in event calendar
-└── tests/                                     # 28 tests (27 run here, 1 needs statsmodels)
+└── tests/                                     # 28 tests (26 run in CI, 2 need optional extras)
 ```
 
 ---
@@ -469,7 +469,7 @@ Credentials are only in a local `.env` file or the environment. Git ignores `.en
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **27 passed, 1 skipped** (statsmodels not installed). Expected in CI: 26 passed, 2 skipped (no statsmodels, no torch) | `pytest -q` |
+| Unit tests | **26 passed, 2 skipped** in CI (statsmodels and torch are not installed). With the `deep` extra: 27 passed, 1 skipped | `pytest -q` |
 | Cross-check with statsmodels 0.15 | ADF statistic and p-value, Granger F and p, VAR coefficients are equal | `pytest tests/test_analysis.py` with the `stats` extra |
 | Synthetic sentiment validation | Accuracy 1.000 on 9,396 texts, recall 1.000 for each class | `ballots-to-markets sentiment --synthetic` |
 | Synthetic Granger, planted lead to `sp500` | Lag 1: F = 12.35, p = 0.0005, q = 0.0065 | `ballots-to-markets causality --synthetic` |
@@ -512,7 +512,7 @@ Read these problems before you use the results.
 3. **Text tests need coverage.** Below 60% coverage, the Granger tests on text are refused.
 4. **Each forecast has a baseline.** R² is relative to the historical mean, and a DM test compares each model with zero.
 5. **The methods find planted effects.** On synthetic data, q = 0.0065 for the planted lead. Gold, the null asset, gets q = 0.549.
-6. **The full demo runs offline.** 27 tests run with no download and no key.
+6. **The full demo runs offline.** In CI, 26 tests pass with no download and no key.
 
 ---
 
