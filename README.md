@@ -74,6 +74,7 @@ This README is the **one location that explains all of ballots-to-markets**. It 
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one text](#42-the-life-cycle-of-one-text)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 📥 [The loaders and the fetchers](#5-the-loaders-and-the-fetchers)
 6. 📅 [The trading-day alignment](#6-the-trading-day-alignment)
 7. 💬 [The sentiment models](#7-the-sentiment-models)
@@ -144,6 +145,47 @@ flowchart LR
 | CLI | `src/ballots_to_markets/cli.py` | The `ballots-to-markets` command with 8 subcommands |
 | Event calendar | `src/ballots_to_markets/data/events_2024.csv` | 16 election and FOMC events |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>8 subcommands"]
+    CFG["config.py<br/>Settings.from_env, merge"]
+    FET["fetch.py<br/>fetch_prices, fetch_fred"]
+    SYN["synthetic.py<br/>generate, write_csv"]
+    PIPE["pipeline.py<br/>load_study, event_study,<br/>causality, forecasts"]
+    subgraph PREP["Data and alignment"]
+        DATA["data.py<br/>load_prices, load_rate_csv,<br/>load_text_csv, load_events"]
+        MKT["market.py<br/>return_panel, rate_changes"]
+        TXD["textdays.py<br/>to_trading_day, daily_features"]
+        SEN["sentiment.py<br/>LexiconSentiment, HFSentiment,<br/>validate"]
+    end
+    subgraph ANA["Analyses"]
+        EVS["event_study.py<br/>run, by_kind, benjamini_hochberg"]
+        CAU["causality.py<br/>adf, granger_table"]
+        FOR["forecast.py<br/>design, walk_forward, score"]
+        LSTM["lstm.py<br/>LSTMRegressor, extra deep"]
+    end
+    REP["report.py<br/>build, write"]
+
+    CLI --> CFG
+    CLI --> FET
+    CLI --> SYN
+    CLI --> PIPE
+    CLI --> REP
+    PIPE --> SYN
+    PIPE --> DATA
+    PIPE --> MKT
+    PIPE --> TXD
+    PIPE --> SEN
+    PIPE --> EVS
+    PIPE --> CAU
+    PIPE --> FOR
+    TXD --> SEN
+    CAU -- "benjamini_hochberg" --> EVS
+    FOR -. "model lstm" .-> LSTM
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -207,40 +249,135 @@ The event study and the Granger table give Benjamini-Hochberg q-values over all 
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    P["prices/*.csv"] --> R["Log returns on trading days (inner join)"]
-    F["fed_funds.csv"] --> RC["Rate level and rate change on trading days"]
-    T["texts.csv"] --> M["Map each text to its text day"]
-    M --> S["Sentiment class for each text"]
-    S --> V["Validation against labels (if present)"]
-    S --> D["Daily features: n_texts, mean, shares, has_text"]
-    E["events_2024.csv"] --> ES["Event study: CAR, t, p, q"]
+flowchart TD
+    SRC{"--synthetic?"} -- "yes" --> SYN["synthetic.generate:<br/>planted effects"]
+    SRC -- "no" --> P[/"data/prices/*.csv"/]
+    SRC -- "no" --> F[/"data/fed_funds.csv"/]
+    SRC -- "no" --> T[/"texts.csv or --texts"/]
+    P --> R["Log returns on trading days,<br/>inner join"]
+    SYN --> R
+    F --> RC["Rate level and rate change<br/>on trading days"]
+    SYN --> RC
+    T --> S["Sentiment class for each text"]
+    SYN --> S
+    S --> V["Validation against labels,<br/>if present"]
+    S --> M["Map each text to its text day"]
+    M --> D["Daily features: n_texts, mean,<br/>shares, has_text"]
+    E[/"events_2024.csv or --events"/] --> ES["Event study: CAR, t, p, q"]
     R --> ES
-    R --> ADF["ADF on each return and on daily sentiment"]
-    D --> COV{"Coverage >= 60%?"}
-    COV -- "yes" --> G["Granger F-tests, q-values"]
+    R --> ADF["ADF on each return"]
+    D --> COV{"Coverage at least 60 %?"}
+    COV -- "yes" --> G["ADF on daily sentiment,<br/>Granger F-tests, q-values"]
     COV -- "no" --> REF["Refused, with a note"]
-    R --> FC["Walk-forward forecasts with baselines"]
+    R --> FC["Walk-forward forecasts<br/>with baselines"]
     D --> FC
     RC --> FC
-    ES --> REP["report.md"]
+    ES --> REP[("out/report.md")]
+    ADF --> REP
     G --> REP
+    REF --> REP
     FC --> REP
+    V --> REP
+    REP --> HUMAN{{"HUMAN<br/>analyst reads the tables,<br/>no investment decision"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one text
 
+```mermaid
+stateDiagram-v2
+    state "Loaded text" as Loaded
+    state "Dropped" as Dropped
+    state "Classified" as Classified
+    state "Local timestamp" as Local
+    state "Next calendar day" as NextDay
+    state "Mapped to a text day" as Mapped
+    state "After the last trading day" as Outside
+    state "Daily features" as Daily
+    state "Granger test input" as Granger
+    state "Forecast features" as Forecast
+    [*] --> Loaded: load_text_csv or synthetic.generate
+    Loaded --> Dropped: bad timestamp or empty text
+    Loaded --> Classified: model.predict gives negative, neutral or positive
+    Classified --> Local: naive time localized to B2M_TEXT_TIMEZONE
+    Local --> NextDay: hour at or after the market close hour
+    Local --> Mapped: first trading day at or after the date
+    NextDay --> Mapped: first trading day at or after the date
+    Local --> Outside: no trading day left, NaT
+    NextDay --> Outside: no trading day left, NaT
+    Mapped --> Daily: n_texts, sentiment_mean, shares, has_text
+    Daily --> Granger: sentiment_mean, rows with NaN dropped
+    Daily --> Forecast: fill_for_models, 0 and has_text
+    Dropped --> [*]
+    Outside --> [*]
+    Granger --> [*]
+    Forecast --> [*]
+```
+
 1. The loader reads the text, its timestamp and its optional label.
-2. A naive timestamp is local time in `B2M_TEXT_TIMEZONE` (New York).
-3. If the time is at or after 16:00, the text moves to the next calendar day.
-4. The text goes to the first trading day at or after that day.
-5. The sentiment model gives the text a class.
+2. The sentiment model gives the text a class.
+3. A naive timestamp is local time in `B2M_TEXT_TIMEZONE` (New York).
+4. If the time is at or after 16:00, the text moves to the next calendar day.
+5. The text goes to the first trading day at or after that day.
 6. The daily features count the texts and average their class scores.
 7. The Granger test uses the daily mean. The forecasts use all daily features.
+
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor AN as Analyst
+    participant CLI as ballots-to-markets CLI
+    participant PIPE as pipeline.py
+    participant SRC as data.py or synthetic.py
+    participant SEN as sentiment.py
+    participant ANA as event_study, causality, forecast
+    participant FS as out/ folder
+
+    AN->>CLI: ballots-to-markets report --synthetic
+    CLI->>CLI: Settings.from_env, merge the options
+    CLI->>PIPE: load_study(settings, synthetic)
+    PIPE->>SRC: generate, or load prices, rate and texts
+    PIPE->>PIPE: return_panel, rate_changes
+    PIPE->>SEN: build(model), predict, validate if labels
+    PIPE->>PIPE: daily_features, coverage and flat-rate notes
+    PIPE-->>CLI: Study
+    CLI->>ANA: event_study: run, by_kind
+    ANA-->>CLI: event table and CAAR table
+    CLI->>ANA: causality: adf, granger_table
+    ANA-->>CLI: ADF table, Granger table or refusal
+    CLI->>ANA: forecasts for sp500 and gold: design, walk_forward, score
+    ANA-->>CLI: forecast tables
+    CLI->>FS: report.build, then report.write
+    CLI-->>AN: wrote out/report.md
+```
 
 ---
 
 ## 5. The loaders and the fetchers
+
+**Purpose.** Read the local files with schema checks, and download the prices and the policy rate to a file cache.
+
+```mermaid
+flowchart TD
+    BASE[/"B2M_DATA_DIR or --data-dir"/] --> LP["load_prices: one file<br/>for each of the 5 assets"]
+    LP --> PX{"File present?"}
+    PX -- "no" --> FNF[/"FileNotFoundError:<br/>run fetch"/]
+    PX -- "yes" --> PC["load_prices_csv: Date and Close,<br/>no duplicate date, close above 0"]
+    BASE --> LR["load_rate_csv: date and value,<br/>or observation_date and series"]
+    LR --> RN["Values to numbers,<br/>drop the FRED dot values"]
+    TX[/"texts.csv or --texts files"/] --> LT["load_text_csv: timestamp, tweet_text,<br/>optional sentiment, candidate"]
+    LT --> TD["Drop bad timestamps<br/>and empty texts, sort"]
+    EV[/"--events or the built-in<br/>events_2024.csv"/] --> LE["load_events: date, name, kind,<br/>sort by date"]
+    LT -. "column absent" .-> SE[/"SchemaError"/]
+    PC --> OUT[/"Prices, rate, texts, events"/]
+    RN --> OUT
+    TD --> OUT
+    LE --> OUT
+```
 
 | Loader | File | Checks |
 |---|---|---|
@@ -251,13 +388,58 @@ flowchart TB
 
 **Procedure of `ballots-to-markets fetch`**
 
+```mermaid
+flowchart LR
+    S[/"Settings: data_dir, start, end,<br/>--refresh"/] --> YF{"yfinance installed?"}
+    YF -- "no" --> E1[/"RuntimeError: install<br/>the fetch extra"/]
+    YF -- "yes" --> A["For each asset in ASSETS"]
+    A --> C1{"prices file absent<br/>or --refresh?"}
+    C1 -- "yes" --> DL["yf.download ticker,<br/>save Date, Close"]
+    C1 -- "no" --> KEEP["Use the cached file"]
+    DL --> F{"fed_funds.csv absent<br/>or --refresh?"}
+    KEEP --> F
+    F -- "no" --> K2[/"Use the cached file"/]
+    F -- "yes" --> K{"FRED_API_KEY set?"}
+    K -- "no" --> E2[/"RuntimeError:<br/>FRED_API_KEY is not set"/]
+    K -- "yes" --> FR["FRED API: series DFF,<br/>drop dot values"]
+    FR --> OUT[/"data/fed_funds.csv"/]
+```
+
 1. For each asset, if `data/prices/<asset>.csv` does not exist (or `--refresh` is set), download the daily prices with yfinance.
-2. If `data/fed_funds.csv` does not exist, download the FRED series `DFF` with `FRED_API_KEY`.
+2. If `data/fed_funds.csv` does not exist (or `--refresh` is set), download the FRED series `DFF` with `FRED_API_KEY`.
 3. Keep the files as a cache for the next run.
 
 ---
 
 ## 6. The trading-day alignment
+
+**Purpose.** Put the returns, the policy rate and the texts on one trading-day index with no invented values.
+
+```mermaid
+flowchart TD
+    subgraph RET["Returns: market.py"]
+        P[/"Prices with NaN<br/>on closed days"/] --> LR1["log_returns: each asset<br/>on its own trading days"]
+        LR1 --> J["Keep the days with a return<br/>for all assets, count the dropped days"]
+        J --> N30{"At least 30 days?"}
+        N30 -- "no" --> E1[/"ValueError"/]
+        N30 -- "yes" --> PAN[/"ReturnPanel"/]
+    end
+    subgraph RATE["Policy rate: market.py"]
+        R[/"Rate series"/] --> FF["Last known value<br/>on each trading day"]
+        FF --> CH["rate_change and<br/>rate_move_day"]
+        FF --> FL{"Fewer than 5<br/>distinct values?"}
+        FL -- "yes" --> NOTE[/"Note: models use<br/>only the changes"/]
+    end
+    subgraph TXT["Text day: textdays.py"]
+        T[/"Text timestamp"/] --> TZ["Naive time: localize to New York,<br/>repeated hour as standard time"]
+        TZ --> AC{"Hour at or after 16?"}
+        AC -- "yes" --> ND["Add one calendar day"]
+        AC -- "no" --> SS["searchsorted: first trading day<br/>at or after the date"]
+        ND --> SS
+    end
+    PAN --> FF
+    PAN --> SS
+```
 
 | Rule | Value |
 |---|---|
@@ -271,6 +453,25 @@ flowchart TB
 ---
 
 ## 7. The sentiment models
+
+**Purpose.** Give each text one of three classes, and validate the model on labelled texts.
+
+```mermaid
+flowchart TD
+    NAME[/"B2M_SENTIMENT_MODEL<br/>or --sentiment-model"/] --> B{"lexicon?"}
+    B -- "yes" --> TOK["LexiconSentiment: lower case,<br/>split the words"]
+    B -- "no" --> HF["HFSentiment:<br/>transformers pipeline"]
+    HF --> L3{"Labels include negative,<br/>neutral and positive?"}
+    L3 -- "no" --> ERR[/"ValueError:<br/>not a 3-class model"/]
+    L3 -- "yes" --> HP["Label of the model,<br/>lower case"]
+    TOK --> SC["+1 for a positive word, −1 for a negative word,<br/>sign change after a negator in the 3 words before"]
+    SC --> NORM["Divide by the square root<br/>of the word count"]
+    NORM --> CLS["Class: above 0 positive,<br/>below 0 negative, 0 neutral"]
+    CLS --> HASL{"Texts have labels?"}
+    HP --> HASL
+    HASL -- "yes" --> VAL[/"validate: accuracy, macro F1,<br/>recall of each class, confusion"/]
+    HASL -- "no" --> NOV[/"No validation"/]
+```
 
 | Model | Setting | Classes | Needs |
 |---|---|---|---|
@@ -293,6 +494,25 @@ flowchart TB
 
 **Purpose.** Measure the abnormal return around each event.
 
+```mermaid
+flowchart TD
+    IN[/"Return panel, events,<br/>window −1 to +1"/] --> EV["For each event and each asset"]
+    EV --> D0["Day 0: first trading day<br/>at or after the event date"]
+    D0 --> WIN{"Event window inside<br/>the panel?"}
+    WIN -- "no" --> SKIP["Skip the pair"]
+    WIN -- "yes" --> EST["Estimation window: up to 120 days,<br/>ends 10 days before the window"]
+    EST --> M60{"At least 60 days?"}
+    M60 -- "no" --> SKIP
+    M60 -- "yes" --> MK{"Asset is sp500?"}
+    MK -- "yes" --> CM["Constant-mean model"]
+    MK -- "no" --> MM["Market model:<br/>alpha + beta × sp500"]
+    CM --> AR["Abnormal returns in the window,<br/>CAR, t = CAR / (σ × √n), p"]
+    MM --> AR
+    AR --> BH["Benjamini-Hochberg q_bh over<br/>all events and assets"]
+    BH --> KIND["by_kind: CAAR and<br/>t-test across events"]
+    KIND --> OUT[/"Event table and CAAR table"/]
+```
+
 **Procedure**
 
 1. Find day 0: the first trading day at or after the event date.
@@ -310,6 +530,20 @@ flowchart TB
 
 ## 9. The causality tests
 
+**Purpose.** Test each series for a unit root, and test if daily sentiment leads the returns.
+
+```mermaid
+flowchart TD
+    IN[/"Return panel and<br/>daily features"/] --> ADF["adf on each return:<br/>lag k by AIC, MacKinnon p"]
+    ADF --> COV{"Coverage at least<br/>B2M_MIN_TEXT_COVERAGE?"}
+    COV -- "no" --> REF[/"granger None,<br/>refused with the reason"/]
+    COV -- "yes" --> ADFS["adf on sentiment_mean,<br/>NaN days dropped"]
+    ADFS --> JOIN["Join the returns<br/>and sentiment_mean"]
+    JOIN --> GT["granger_table: sentiment_mean<br/>to each asset, lags 1, 2, 3, 5"]
+    GT --> BH["Benjamini-Hochberg q_bh"]
+    BH --> OUT[/"ADF table and Granger table"/]
+```
+
 | Test | Method | Output |
 |---|---|---|
 | ADF | Regression of Δy on a constant, y(t−1) and k lags of Δy. k from AIC, at most 12 × (n/100)^0.25 | t-statistic, MacKinnon p-value, k, observations |
@@ -317,12 +551,44 @@ flowchart TB
 | VAR | OLS of all series on their lags. Lag from AIC (1 to 5) | Coefficients, one-step forecast |
 
 The ADF, Granger and VAR code uses NumPy and SciPy only. A test compares it with statsmodels when the `stats` extra is installed. On the cross-check data, the statistics are equal.
+No CLI command and no report part calls the VAR (`fit_var`) at this time. Only the tests use it.
+
+One Granger test (one cause, one effect, one lag p) has these steps:
+
+```mermaid
+flowchart LR
+    IN[/"Effect, cause, lag p"/] --> LAG["Lags on the<br/>trading-day index"]
+    LAG --> DROP["Drop the rows<br/>with a NaN"]
+    DROP --> N{"More than<br/>3p + 2 rows?"}
+    N -- "no" --> NOTE[/"Row with NaN F<br/>and a note"/]
+    N -- "yes" --> R["Restricted OLS:<br/>constant + effect lags"]
+    N -- "yes" --> U["Unrestricted OLS:<br/>+ cause lags"]
+    R --> F["F = ((RSS_r − RSS_u) / p)<br/>/ (RSS_u / (n − 2p − 1))"]
+    U --> F
+    F --> OUT[/"F, p, nobs"/]
+```
 
 ---
 
 ## 10. The walk-forward forecasts
 
 **Purpose.** Forecast the return of the next trading day, and compare each model with the baselines.
+
+```mermaid
+flowchart TD
+    IN[/"Returns, text features filled with 0,<br/>rate_change"/] --> DES["design: 3 lags of each return,<br/>day t to t−2, text features, rate change"]
+    DES --> Y["Target: return of the target asset<br/>on day t+1, drop the NaN rows"]
+    Y --> CHK{"Start row at least 30<br/>and 10 or more test rows?"}
+    CHK -- "no" --> ERR[/"ValueError"/]
+    CHK -- "yes" --> BL["Next block of 20 rows,<br/>from 60 % of the rows"]
+    BL --> FIT["Each model: fit on all<br/>earlier rows"]
+    FIT --> PR["Forecast the block"]
+    PR --> MORE{"More blocks?"}
+    MORE -- "yes" --> BL
+    MORE -- "no" --> SC["score: RMSE, MAE, R² vs hist_mean,<br/>direction accuracy"]
+    SC --> DM["Diebold-Mariano<br/>against zero"]
+    DM --> OUT[/"Forecast table<br/>for the target"/]
+```
 
 | Model | What it is |
 |---|---|
@@ -345,6 +611,19 @@ The ADF, Granger and VAR code uses NumPy and SciPy only. A test compares it with
 
 ## 11. The decision rules
 
+**Purpose.** Keep each threshold in one location. The diagram shows the step that uses each rule.
+
+```mermaid
+flowchart LR
+    R1["Market close<br/>16:00 New York"] --> S1["textdays.to_trading_day"]
+    R2["Flat-column limit<br/>fewer than 5 values"] --> S2["market.informative_columns:<br/>rate level not used"]
+    R3["Event window −1 to +1,<br/>estimation 120, gap 10, minimum 60"] --> S3["event_study.abnormal_returns"]
+    R4["Coverage at least 0.6"] --> S4["pipeline.causality:<br/>Granger on text or refusal"]
+    R5["Granger lags 1, 2, 3, 5"] --> S4
+    R6["Walk-forward start 60 %,<br/>block 20 rows"] --> S5["forecast.walk_forward"]
+    R7["Significance q below 0.05"] --> S6["The analyst reads the<br/>event and Granger tables"]
+```
+
 | Rule | Value | Module |
 |---|---|---|
 | Minimum text coverage for Granger tests | 0.6 (`B2M_MIN_TEXT_COVERAGE`) | `pipeline.py` |
@@ -352,17 +631,35 @@ The ADF, Granger and VAR code uses NumPy and SciPy only. A test compares it with
 | Event window | −1 to +1 trading days | `event_study.py` |
 | Estimation window | 120 days, gap 10, minimum 60 | `event_study.py` |
 | Granger lags | 1, 2, 3, 5 | `pipeline.py` |
-| VAR maximum lag | 5 | `causality.py` |
+| VAR maximum lag | 5 (the pipeline does not use the VAR) | `causality.py` |
 | Flat-column limit | fewer than 5 distinct values | `market.py` |
 | Walk-forward start, block | 60% of the rows, 20 rows | `forecast.py` |
 | ADF critical values (constant) | 1%: −3.43, 5%: −2.86, 10%: −2.57 | `causality.py` |
-| Significance | q < 0.05 | All tables |
+| Significance | q < 0.05 (a reading rule, the code does not flag rows) | All tables |
 
 ---
 
 ## 12. The report
 
 `ballots-to-markets report` writes `report.md` with these parts:
+
+```mermaid
+flowchart TD
+    IN[/"Study, event tables,<br/>causality result, forecast tables"/] --> H["Header: SYNTHETIC or local files,<br/>trading days, dropped days"]
+    H --> CV["Text coverage and<br/>sentiment model"]
+    CV --> NT["NOTE lines:<br/>low coverage, flat rate level"]
+    NT --> VQ{"Validation present?"}
+    VQ -- "yes" --> SV["Sentiment validation part"]
+    VQ -- "no" --> EV["Event study table,<br/>mean CAR by kind"]
+    SV --> EV
+    EV --> ADF["ADF table"]
+    ADF --> GQ{"Granger refused?"}
+    GQ -- "yes" --> NR["Not reported: the reason"]
+    GQ -- "no" --> GT["Granger table"]
+    NR --> FC["One forecast table<br/>for each target"]
+    GT --> FC
+    FC --> W[/"write: report.md<br/>in the out folder"/]
+```
 
 1. The data source (synthetic or local files), the trading days, the dropped days and the text coverage.
 2. The notes (low coverage, flat rate level).
@@ -384,7 +681,7 @@ The ADF, Granger and VAR code uses NumPy and SciPy only. A test compares it with
 | `src/ballots_to_markets/data/events_2024.csv` | Yes | The built-in event calendar |
 | `out/report.md` | No (git ignores it) | Output of `ballots-to-markets report` |
 | `.env.example` | Yes | All 10 variables, empty |
-| `.env` | No (git ignores it) | Local settings and `FRED_API_KEY` |
+| `.env` | No (git ignores it) | Local settings and `FRED_API_KEY`. The CLI does not read this file (see [14.4](#144-environment-variables)) |
 
 ---
 
@@ -428,10 +725,27 @@ ballots-to-markets synth --out data/synthetic        # the same data as CSV file
 With real data (see `data/README.md`):
 
 ```bash
-export FRED_API_KEY=<your key>     # or put it in .env
+export FRED_API_KEY=<your key>     # the CLI does not read .env
 ballots-to-markets fetch
 ballots-to-markets report --texts data/texts.csv --out out
 ballots-to-markets report --texts train.csv val.csv test.csv --sentiment-model cardiffnlp/twitter-roberta-base-sentiment-latest
+```
+
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> SYNF["--synthetic on an<br/>analysis command"]
+    INS --> SY["synth --out data/synthetic"]
+    SY --> SF[("data/synthetic/<br/>prices, fed_funds.csv, texts.csv")]
+    INS --> KEY["export FRED_API_KEY"]
+    KEY --> FE["fetch"]
+    FE --> DF[("data/prices/*.csv<br/>data/fed_funds.csv")]
+    TX[("data/texts.csv")] --> AN["sentiment, events, causality,<br/>forecast, report"]
+    DF --> AN
+    SF -- "--data-dir" --> AN
+    SYNF --> AN
+    AN -- "report" --> REP[("out/report.md")]
 ```
 
 ### 14.4 Environment variables
@@ -441,14 +755,25 @@ ballots-to-markets report --texts train.csv val.csv test.csv --sentiment-model c
 | `B2M_DATA_DIR` | Loaders, fetch | Data folder. Default `data` |
 | `B2M_OUT_DIR` | Report | Default `out` |
 | `B2M_START`, `B2M_END` | All | Study period. Default 2023-11-01 to 2025-02-10 |
-| `B2M_SEED` | Synthetic data, models | Default 42 |
+| `B2M_SEED` | Synthetic data with `--synthetic`, models | Default 42. The `synth` command uses its own `--seed` option (default 42) |
 | `B2M_TEXT_TIMEZONE` | Text days | Time zone of naive timestamps. Default `America/New_York` |
 | `B2M_MARKET_CLOSE_HOUR` | Text days | Default 16 |
 | `B2M_MIN_TEXT_COVERAGE` | Causality | Default 0.6 |
 | `B2M_SENTIMENT_MODEL` | Sentiment | `lexicon` (default) or a 3-class Hugging Face model |
 | `FRED_API_KEY` | Fetch | FRED key. Never printed |
 
+The CLI reads only the process environment. It does not load the `.env` file, so export its variables before you run a command.
 Credentials are only in a local `.env` file or the environment. Git ignores `.env`. Do not print or commit credentials.
+
+```mermaid
+flowchart LR
+    ENV[/"Process environment<br/>B2M_* and FRED_API_KEY"/] --> FE["Settings.from_env:<br/>int and float conversion"]
+    OPT[/"CLI options: --data-dir, --start,<br/>--end, --seed and others"/] --> MG["merge: a given option wins"]
+    FE --> MG
+    MG --> V{"start before end and<br/>coverage from 0 to 1?"}
+    V -- "yes" --> SET[/"Settings"/]
+    V -- "no" --> ERR[/"ValueError: the CLI prints<br/>error: and returns 2"/]
+```
 
 ---
 
